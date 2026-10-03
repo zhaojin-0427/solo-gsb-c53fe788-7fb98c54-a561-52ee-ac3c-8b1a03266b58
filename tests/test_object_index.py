@@ -496,6 +496,211 @@ def test_concurrent_walk_and_writes(client):
     assert not errors
 
 
+# ---- concurrency: opportunistic purge race -----------------------------------
+
+
+def test_concurrent_requests_purging_same_expired_snapshot(client):
+    """The stale-snapshot cleanup race: many index requests reap the SAME
+    expired rows at the same time.  Every request must answer its page
+    (never 500 on a 40001 from the repeatable-read transaction) and the
+    valid first/continuation pages must stay bound to their snapshots."""
+    import threading
+
+    live_prefix = _path("race-live")
+    for i in range(3):
+        _put(client, f"{live_prefix}/obj-{i}", f"b{i}".encode())
+    first = _get(client, prefix=live_prefix, limit=2).json()
+    live_cursor = first["next_cursor"]
+    assert live_cursor
+
+    rounds = 8
+    for _ in range(rounds):
+        # Several expired snapshots (headers + entries) that every request
+        # below tries to delete simultaneously.
+        _seed_expired_snapshots(5, with_entries=True)
+
+        barrier = threading.Barrier(6)
+        responses = []
+
+        def request(params):
+            barrier.wait()
+            responses.append(_get(client, **params))
+
+        threads = [
+            threading.Thread(target=request, kwargs={"params": {"prefix": _path("race-fresh")}})
+            for _ in range(5)
+        ]
+        threads.append(
+            threading.Thread(
+                target=request,
+                kwargs={
+                    "params": {"prefix": live_prefix, "limit": 2, "cursor": live_cursor}
+                },
+            )
+        )
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        statuses = [r.status_code for r in responses]
+        assert statuses.count(200) == 6, [(s, r.text) for s, r in zip(statuses, responses)]
+        # The replay of the still-valid snapshot returns its exact next
+        # page (same snapshot id, offset 2, the one remaining entry).
+        replays = [r for r in responses if "cursor=" in str(r.request.url)]
+        assert len(replays) == 1
+        body = replays[0].json()
+        assert body["snapshot_id"] == first["snapshot_id"]
+        assert body["offset"] == 2
+        assert [e["path"] for e in body["entries"]] == [f"{live_prefix}/obj-2"]
+
+    # The expired rows (and their cascaded entries) really are reaped.
+    assert _count_expired_rows() == (0, 0)
+
+
+def test_concurrent_replays_of_an_expired_snapshot_are_410(client):
+    """The race with an expired CURSOR: all reapers collide on the same
+    row, and every request must still answer 410 -- never 500."""
+    import threading
+
+    prefix = _path("race-expired-cursor")
+    for i in range(2):
+        _put(client, f"{prefix}/n-{i}", f"b{i}".encode())
+    body = _get(client, prefix=prefix, limit=1).json()
+    snapshot_id = body["snapshot_id"]
+    cursor = body["next_cursor"]
+    _force_expire(snapshot_id)
+
+    barrier = threading.Barrier(8)
+    responses = []
+
+    def replay():
+        barrier.wait()
+        responses.append(_get(client, prefix=prefix, limit=1, cursor=cursor))
+
+    threads = [threading.Thread(target=replay) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert [r.status_code for r in responses] == [410] * 8, [
+        (r.status_code, r.text) for r in responses
+    ]
+    assert all(r.json()["snapshot_id"] == snapshot_id for r in responses)
+    # After the racing reaps, starting over yields a fresh snapshot.
+    fresh = _get(client, prefix=prefix, limit=1)
+    assert fresh.status_code == 200
+    assert fresh.json()["snapshot_id"] != snapshot_id
+
+
+def test_concurrent_purge_is_a_read_committed_unit(base_url):
+    """DB-level check of the chosen transaction boundary: the purge is a
+    single autocommit (read-committed) DELETE, so two connections reaping
+    the same expired row serialise on its row lock -- the loser re-reads
+    an empty set and deletes zero rows instead of raising 40001."""
+    import app.db as db
+
+    async def scenario():
+        dsn = os.environ["DATABASE_URL"]
+        sid = f"purge-race-{uuid.uuid4().hex}"
+        seed = await asyncpg.connect(dsn)
+        try:
+            await seed.execute(
+                "INSERT INTO object_index_snapshots"
+                " (id, prefix, page_limit, total, expires_at)"
+                " VALUES ($1, '', 50, 0, now() - interval '1 minute')",
+                sid,
+            )
+            await seed.execute(
+                "INSERT INTO object_index_entries"
+                " (snapshot_id, ordinal, path, revision_no, etag, media_type, bytes)"
+                " VALUES ($1, 0, 'p', 1, '\"e\"', 'text/plain', 1)",
+                sid,
+            )
+        finally:
+            await seed.close()
+
+        a = await asyncpg.connect(dsn)
+        b = await asyncpg.connect(dsn)
+        try:
+            # No surrounding repeatable-read transaction: each call is its
+            # own read-committed statement, exactly like the endpoint.
+            await asyncio.gather(
+                db.purge_expired_index_snapshots(a),
+                db.purge_expired_index_snapshots(b),
+            )
+        except asyncpg.SerializationError as exc:  # pragma: no cover - the bug
+            raise AssertionError(
+                "concurrent purge raised 40001"
+            ) from exc
+        finally:
+            await a.close()
+            await b.close()
+
+        check = await asyncpg.connect(dsn)
+        try:
+            assert await check.fetchval(
+                "SELECT count(*) FROM object_index_snapshots WHERE id = $1", sid
+            ) == 0
+            assert await check.fetchval(
+                "SELECT count(*) FROM object_index_entries WHERE snapshot_id = $1", sid
+            ) == 0
+        finally:
+            await check.close()
+
+    asyncio.run(scenario())
+
+
+async def _seed_expired_snapshots_async(n: int, with_entries: bool) -> None:
+    conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+    try:
+        for i in range(n):
+            sid = f"expired-{uuid.uuid4().hex}"
+            await conn.execute(
+                "INSERT INTO object_index_snapshots"
+                " (id, prefix, page_limit, total, created_at, expires_at)"
+                " VALUES ($1, 'race-expired', 50, 0,"
+                " now() - interval '20 minutes', now() - interval '10 minutes')",
+                sid,
+            )
+            if with_entries:
+                await conn.execute(
+                    "INSERT INTO object_index_entries"
+                    " (snapshot_id, ordinal, path, revision_no, etag,"
+                    " media_type, bytes)"
+                    " VALUES ($1, 0, 'race-expired/gone', 1, '\"e\"',"
+                    " 'text/plain', 1)",
+                    sid,
+                )
+    finally:
+        await conn.close()
+
+
+def _seed_expired_snapshots(n: int, with_entries: bool = False) -> None:
+    asyncio.run(_seed_expired_snapshots_async(n, with_entries))
+
+
+async def _count_expired_rows_async() -> tuple[int, int]:
+    conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+    try:
+        snaps = await conn.fetchval(
+            "SELECT count(*) FROM object_index_snapshots WHERE expires_at <= now()"
+        )
+        entries = await conn.fetchval(
+            "SELECT count(*) FROM object_index_entries e"
+            " JOIN object_index_snapshots s ON s.id = e.snapshot_id"
+            " WHERE s.expires_at <= now()"
+        )
+        return snaps, entries
+    finally:
+        await conn.close()
+
+
+def _count_expired_rows() -> tuple[int, int]:
+    return asyncio.run(_count_expired_rows_async())
+
+
 # ---- direct-DB helpers --------------------------------------------------------
 
 

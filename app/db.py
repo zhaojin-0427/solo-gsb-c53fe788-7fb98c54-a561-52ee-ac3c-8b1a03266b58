@@ -75,7 +75,11 @@ table deliberately has no foreign key to ``revisions``: a frozen
 index is a short-lived read copy, not a GC retention reason, so PUTs,
 path moves and /gc deletions can neither mutate the frozen rows nor be
 blocked by them; paging reads only the copy, which cannot gain, lose or
-reorder a row.
+reorder a row.  The opportunistic expiry purge is a separate
+autocommit read-committed DELETE, never part of the repeatable-read
+page transaction, so concurrent requests reaping the same expired
+snapshot serialise on its row lock (the loser deletes zero rows)
+instead of raising a repeatable-read 40001.
 """
 from __future__ import annotations
 
@@ -1370,9 +1374,18 @@ async def ensure_index_secret(pool: asyncpg.Pool) -> str:
 async def purge_expired_index_snapshots(conn: asyncpg.Connection) -> None:
     """Best-effort removal of snapshots past their ten-minute lifetime.
 
-    Called at the start of every index request; CASCADE removes their
-    entries too.  Pagination of a purged snapshot then finds no header
-    row and answers 410 -- the semantic equivalent of an expired one.
+    Called at the start of every index request, as its OWN autocommit
+    statement (read committed), NOT inside the caller's repeatable-read
+    page transaction: two requests deleting the same expired row
+    serialise on the row lock there -- the loser re-reads the committed
+    state, matches nothing and deletes zero rows.  Running this DELETE
+    inside a repeatable-read snapshot instead makes the loser raise
+    SQLSTATE 40001 ("could not serialize access due to concurrent
+    delete"), which surfaced as a spurious 500.
+
+    CASCADE removes the entries too.  Pagination of a purged snapshot
+    then finds no header row and answers 410 -- the semantic equivalent
+    of an expired one.
     """
     await conn.execute(
         "DELETE FROM object_index_snapshots WHERE expires_at <= now()"

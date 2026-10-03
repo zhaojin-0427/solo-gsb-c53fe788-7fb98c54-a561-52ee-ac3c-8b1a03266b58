@@ -52,7 +52,12 @@ cursor replays that frozen copy.  Because the copy is a separate,
 revision-free table, concurrent PUTs, path moves and historical
 reclamation never block the walk and never change, repeat or drop a
 page; a tampered or mismatched cursor answers 400, and an expired (or
-purged) snapshot answers 410.
+purged) snapshot answers 410.  The opportunistic purge of expired
+snapshots is a separate read-committed DELETE before the page's
+repeatable-read transaction, so two requests reaping the same expired
+snapshot serialise on the row lock instead of producing a 40001/500,
+while the liveness verdict and the page still share one database
+snapshot.
 """
 from __future__ import annotations
 
@@ -444,9 +449,16 @@ async def list_object_index(request: Request):
     carried prefix and limit agree with the request parameters and with
     the stored snapshot; it then replays the FROZEN copy, so PUTs, path
     moves and historical reclamation between pages neither repeat nor
-    omit entries.  Failures: 400 for an illegal ``limit``/``prefix``
-    parameter or a malformed/tampered/mismatched cursor; 410 when the
-    addressed snapshot has expired (and been purged).
+    omit entries.  The opportunistic purge of expired snapshots runs as
+    its own read-committed statement before the page transaction, so
+    two requests reaping the same expired snapshot serialise on its row
+    lock (the loser deletes zero rows) instead of raising a
+    repeatable-read serialization failure; the liveness verdict and the
+    page itself share one repeatable-read snapshot, giving each page a
+    single, consistent expiry decision.  Failures: 400 for an illegal
+    ``limit``/``prefix`` parameter or a malformed/tampered/mismatched
+    cursor; 410 when the addressed snapshot has expired (and been
+    purged).
     """
     params = _parse_index_params(request)
     if isinstance(params, JSONResponse):
@@ -476,14 +488,28 @@ async def list_object_index(request: Request):
             )
 
     async with pool.acquire() as conn:
-        # One repeatable-read transaction for the whole request: purge,
-        # materialisation/replay and the page read share one database
-        # snapshot (and one transaction-time now()), so a concurrent
-        # purge crossing the expiry boundary can neither remove a page
-        # we have validated as live nor resurrect one that is expired.
+        # The opportunistic purge runs in its OWN read-committed
+        # statement, deliberately outside the repeatable-read transaction
+        # below.  Two requests reaping the same expired snapshot would
+        # otherwise collide: under repeatable read the DELETE that loses
+        # the row lock re-checks against its frozen snapshot, finds the
+        # row it was deleting gone, and raises 40001 (an unhandled 500).
+        # As a plain autocommit DELETE the loser instead waits on the row
+        # lock, re-reads the committed state, finds an empty target set
+        # and deletes zero rows -- clean idempotence with no retry loop.
+        # A purge that commits while this request starts its page
+        # transaction can only ever remove OTHER snapshots (never the one
+        # this request is creating), and replay liveness is decided in
+        # the repeatable-read snapshot below, so the expiry verdict and
+        # the page stay mutually consistent.
+        await database.purge_expired_index_snapshots(conn)
+
+        # One repeatable-read transaction for the page itself: the
+        # snapshot materialisation/replay and the page read share one
+        # database snapshot (and one transaction-time now()), so a
+        # concurrent purge crossing the expiry boundary can neither
+        # remove a page validated as live nor resurrect an expired one.
         async with conn.transaction(isolation="repeatable_read"):
-            # Opportunistically reap expired snapshots on every request.
-            await database.purge_expired_index_snapshots(conn)
             if cur is None:
                 # The walk still takes no row locks (plain SELECT): the
                 # repeatable-read snapshot only freezes the read, it
