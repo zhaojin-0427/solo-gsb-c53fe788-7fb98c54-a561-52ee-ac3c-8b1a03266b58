@@ -52,7 +52,10 @@ cursor replays that frozen copy.  Because the copy is a separate,
 revision-free table, concurrent PUTs, path moves and historical
 reclamation never block the walk and never change, repeat or drop a
 page; a tampered or mismatched cursor answers 400, and an expired (or
-purged) snapshot answers 410.
+purged) snapshot answers 410.  The opportunistic purge of expired
+snapshots runs in its own READ COMMITTED transaction, so two requests
+reaping the same expired row converge instead of aborting each other's
+repeatable-read page transaction with a serialization failure.
 """
 from __future__ import annotations
 
@@ -476,14 +479,30 @@ async def list_object_index(request: Request):
             )
 
     async with pool.acquire() as conn:
-        # One repeatable-read transaction for the whole request: purge,
-        # materialisation/replay and the page read share one database
-        # snapshot (and one transaction-time now()), so a concurrent
-        # purge crossing the expiry boundary can neither remove a page
-        # we have validated as live nor resurrect one that is expired.
-        async with conn.transaction(isolation="repeatable_read"):
-            # Opportunistically reap expired snapshots on every request.
+        # The opportunistic cleanup runs in its OWN short READ COMMITTED
+        # transaction, deliberately separated from the read-only page
+        # transaction below.  Two index requests whose purges delete the
+        # same expired snapshot row would, under REPEATABLE READ, race on
+        # that row: the second DELETE waits for the first to commit and
+        # then aborts the whole request with SQLSTATE 40001
+        # (serialization_failure) -- a spurious 500.  READ COMMITTED
+        # instead re-evaluates the DELETE against the latest committed
+        # row version, so concurrent purges simply converge to "the row
+        # is gone" without an abort.  Retries are deliberately NOT used:
+        # with the purge outside it, the page transaction is read-only
+        # (SELECT + new INSERTs with a random primary key) and cannot
+        # reach a serialization failure, so there is no request to retry.
+        async with conn.transaction(isolation="read_committed"):
             await database.purge_expired_index_snapshots(conn)
+
+        # One repeatable-read transaction for materialisation/replay and
+        # the page read: both statements share one database snapshot (and
+        # one transaction-time now()), so a purge committed between them
+        # can neither remove a page we have validated as live nor
+        # resurrect one that is expired -- expired rows are only deleted
+        # by the separate purge transaction, and this snapshot keeps
+        # reading their pre-delete versions until it commits.
+        async with conn.transaction(isolation="repeatable_read"):
             if cur is None:
                 # The walk still takes no row locks (plain SELECT): the
                 # repeatable-read snapshot only freezes the read, it

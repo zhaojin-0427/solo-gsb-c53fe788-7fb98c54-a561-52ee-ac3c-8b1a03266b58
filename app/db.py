@@ -1373,6 +1373,14 @@ async def purge_expired_index_snapshots(conn: asyncpg.Connection) -> None:
     Called at the start of every index request; CASCADE removes their
     entries too.  Pagination of a purged snapshot then finds no header
     row and answers 410 -- the semantic equivalent of an expired one.
+
+    Must run in its OWN short READ COMMITTED transaction, never inside
+    the repeatable-read page transaction: when two requests purge the
+    same expired snapshot row under REPEATABLE READ, the second DELETE
+    blocks until the first commits and then aborts with SQLSTATE 40001
+    (serialization_failure), surfacing as a spurious 500.  READ COMMITTED
+    re-checks the predicate against the latest committed row version, so
+    concurrent purges converge harmlessly on the row being gone.
     """
     await conn.execute(
         "DELETE FROM object_index_snapshots WHERE expires_at <= now()"

@@ -496,6 +496,152 @@ def test_concurrent_walk_and_writes(client):
     assert not errors
 
 
+# ---- concurrency: opportunistic purge of the same expired snapshot -----------
+
+
+def test_concurrent_purge_same_expired_rows_never_40001(base_url):
+    """DB-level regression: two requests reaping the SAME expired
+    snapshot rows at the same time must both commit.  The purge runs in
+    its own READ COMMITTED transaction; under REPEATABLE READ the loser
+    of the row race aborts with SQLSTATE 40001 (the old 500 bug)."""
+    import app.db as db
+
+    async def scenario():
+        dsn = os.environ["DATABASE_URL"]
+        setup = await asyncpg.connect(dsn)
+        tag = uuid.uuid4().hex
+        expired_ids = [f"idx/expired-{tag}-{i}" for i in range(5)]
+        await setup.executemany(
+            "INSERT INTO object_index_snapshots (id, prefix, page_limit,"
+            " total, expires_at)"
+            " VALUES ($1, '', 50, 0, now() - interval '1 minute')",
+            [(sid,) for sid in expired_ids],
+        )
+        await setup.close()
+
+        results = []
+
+        async def purge(barrier):
+            conn = await asyncpg.connect(dsn)
+            try:
+                # Same boundary/order the endpoint uses now: purge alone
+                # in a READ COMMITTED transaction.
+                async with conn.transaction(isolation="read_committed"):
+                    await barrier.wait()
+                    await db.purge_expired_index_snapshots(conn)
+                results.append("committed")
+            except asyncpg.exceptions.SerializationError as exc:
+                results.append(f"40001:{exc.sqlstate}")
+            finally:
+                await conn.close()
+
+        barrier = asyncio.Barrier(4)
+        await asyncio.gather(*(purge(barrier) for _ in range(4)))
+
+        check = await asyncpg.connect(dsn)
+        try:
+            remaining = await check.fetchval(
+                "SELECT count(*) FROM object_index_snapshots WHERE id = ANY($1)",
+                expired_ids,
+            )
+        finally:
+            await check.close()
+        assert results == ["committed"] * 4, results
+        assert remaining == 0
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_requests_purging_same_expired_snapshot(client):
+    """HTTP-level regression: many index requests whose opportunity to
+    purge overlaps while a cursor addresses an already-expired snapshot
+    answer 410 (never 500); no-cursor requests in the same wave answer
+    200 with their own fresh snapshots (never 500)."""
+    import threading
+
+    prefix = _path("purge-race")
+    for i in range(3):
+        _put(client, f"{prefix}/n-{i}", f"b{i}".encode())
+    body = _get(client, prefix=prefix, limit=1).json()
+    snapshot_id = body["snapshot_id"]
+    stale_cursor = body["next_cursor"]
+    _force_expire(snapshot_id)
+
+    statuses: list[int] = []
+    barrier = threading.Barrier(8)
+    lock = threading.Lock()
+
+    def request(with_cursor: bool):
+        barrier.wait()
+        params = {"prefix": prefix, "limit": 1}
+        if with_cursor:
+            params["cursor"] = stale_cursor
+        r = _get(client, **params)
+        with lock:
+            statuses.append(r.status_code)
+
+    threads = [
+        threading.Thread(target=request, args=(i % 2 == 0,)) for i in range(8)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Four cursor requests address the expired snapshot -> 410; four
+    # no-cursor requests materialise fresh snapshots -> 200; nothing 5xx.
+    assert sorted(statuses) == [200] * 4 + [410] * 4, statuses
+
+    # The expired row really was purged; paging the fresh snapshot works.
+    fresh = _get(client, prefix=prefix, limit=1)
+    assert fresh.status_code == 200
+    assert fresh.json()["snapshot_id"] != snapshot_id
+    pages, entries = _walk(client, prefix=prefix, limit=2)
+    assert len(entries) == 3
+
+
+def test_expired_snapshot_purge_does_not_disturb_live_replay(client):
+    """Purging another expired snapshot must not change a live snapshot
+    page or its expiry decision: first requests in the purge wave get
+    the new snapshot, and a valid cursor keeps replaying its own frozen
+    pages with no duplicates/omissions."""
+    live_prefix = _path("purge-live")
+    for i in range(4):
+        _put(client, f"{live_prefix}/n-{i}", f"b{i}".encode())
+    first = _get(client, prefix=live_prefix, limit=2).json()
+    live_id = first["snapshot_id"]
+    page2_cursor = first["next_cursor"]
+
+    # An unrelated expired snapshot exists, so every request below also
+    # performs the opportunistic DELETE of that same row concurrently.
+    other = _get(client, prefix=_path("purge-other"), limit=1).json()
+    _force_expire(other["snapshot_id"])
+
+    def replay(cursor):
+        return _get(
+            client, prefix=live_prefix, limit=2, cursor=cursor
+        )
+
+    # Replay page 1 and page 2 repeatedly while the shared expired row is
+    # being reaped; all answers stay stable, none are 5xx.
+    r1 = replay(_start_cursor(first))
+    assert r1.status_code == 200
+    assert r1.json() == first
+    r2 = replay(page2_cursor)
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["snapshot_id"] == live_id
+    assert [e["path"] for e in r2.json()["entries"]] == [
+        f"{live_prefix}/n-2",
+        f"{live_prefix}/n-3",
+    ]
+    assert r2.json()["next_cursor"] is None
+    # Expiry judgement for the live snapshot is unchanged (still valid).
+    check = _get(client, prefix=live_prefix, limit=2,
+                 cursor=_start_cursor(first))
+    assert check.status_code == 200
+    assert check.json()["snapshot_id"] == live_id
+
+
 # ---- direct-DB helpers --------------------------------------------------------
 
 
